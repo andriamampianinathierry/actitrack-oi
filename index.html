@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Portail Agent — RPI OI / Guichet VDC</title>
+<title>ACTIVITY and Tracking</title>
 <style>
 /* ==========================================================================
    Styles communs / RPI OI (variables par défaut au niveau :root)
@@ -3217,6 +3217,11 @@
     <div class="field">
       <label for="portalUrlAux">URL Web App — AUX</label>
       <input type="text" id="portalUrlAux" placeholder="https://script.google.com/macros/s/.../exec">
+    </div>
+
+    <div class="field">
+      <label for="portalUrlTt">URL Web App — Temps par activités (suivi partagé superviseurs)</label>
+      <input type="text" id="portalUrlTt" placeholder="https://script.google.com/macros/s/.../exec">
     </div>
 
     <p class="admin-err" id="portalAdminManageErr">Veuillez saisir une URL valide pour chaque champ.</p>
@@ -7029,6 +7034,7 @@
   const urlRjdInput = document.getElementById('portalUrlRjd');
   const urlIncidentInput = document.getElementById('portalUrlIncident');
   const urlAuxInput = document.getElementById('portalUrlAux');
+  const urlTtInput = document.getElementById('portalUrlTt');
 
   window.openPortalAdminAuth = function(){
     passwordInput.value = '';
@@ -7067,6 +7073,7 @@
     try { urlRjdInput.value = localStorage.getItem('portal_dedicated_url_rjd_v1') || 'https://script.google.com/macros/s/AKfycbzt6K540BLgGaI1h8Qf_QlrBoTkGSF0o2Xn72wz96f8h6U4CQladyTf5xGIwKxisleO9A/exec'; } catch(e){ urlRjdInput.value = ''; }
     try { urlAuxInput.value = localStorage.getItem('portal_dedicated_url_aux_v1') || window.DEDICATED_getWebappUrl('aux'); } catch(e){ urlAuxInput.value = ''; }
     try { urlIncidentInput.value = localStorage.getItem('portal_dedicated_url_incident_v1') || 'https://script.google.com/macros/s/AKfycbyXgpdNn2jo__oRty-iHHnXCujObvyxRX_Fd4ZxujnQQyMHOFd1eFKG1Udlif3rAvbc5g/exec'; } catch(e){ urlIncidentInput.value = ''; }
+    try { urlTtInput.value = localStorage.getItem('portal_dedicated_url_tt_v1') || 'https://script.google.com/macros/s/AKfycbx4iXRkV9k_rZe3y1Y4FAhGePqYv3i6Gxo8XKvuVJnciY4OFLAvLFg7UONDcEwcVAlBtA/exec'; } catch(e){ urlTtInput.value = ''; }
     manageOverlay.classList.add('show');
   }
 
@@ -7091,6 +7098,7 @@
       window.DEDICATED_setWebappUrl('rjd', urlRjdInput.value.trim());
       window.DEDICATED_setWebappUrl('incident', urlIncidentInput.value.trim());
       window.DEDICATED_setWebappUrl('aux', urlAuxInput.value.trim());
+      try { localStorage.setItem('portal_dedicated_url_tt_v1', urlTtInput.value.trim()); } catch(e){}
     }
     closeManage();
     alert('URL enregistrées. Facebook, Indexation, Mails et Encaissement utilisent leur URL dédiée si renseignée (sinon l\'URL fusionnée). RPI OI, Guichet VDC et ASP OI restent sur l\'URL fusionnée. Rechargez la page pour resynchroniser.');
@@ -7327,6 +7335,56 @@
   let sessions = load();
   let current = null; // session ouverte en cours
 
+  // ---- Synchronisation centrale (Gsheet) : chaque navigateur envoie ses sessions au serveur ;
+  // les superviseurs relisent les sessions de TOUS les agents. Sans URL configurée, tout reste local.
+  const TT_URL_KEY = 'portal_dedicated_url_tt_v1';
+  const TT_DEFAULT_URL = 'https://script.google.com/macros/s/AKfycbx4iXRkV9k_rZe3y1Y4FAhGePqYv3i6Gxo8XKvuVJnciY4OFLAvLFg7UONDcEwcVAlBtA/exec';
+  function ttUrl(){ try { const v = (localStorage.getItem(TT_URL_KEY) || '').trim(); if (v) return v; } catch(e){} return TT_DEFAULT_URL; }
+  function uidOf(s){ return s.uid || (s.uid = s.agent + '|' + s.activity + '|' + s.start); }
+  let remote = []; // sessions de tous les agents lues sur le serveur (superviseurs)
+  const STALE_MS = 150000; // session distante sans signal depuis 2,5 min => considérée terminée
+  function view(){
+    if (!remote.length) return sessions;
+    const now = Date.now(), map = new Map();
+    remote.forEach(r => {
+      const x = Object.assign({}, r);
+      if (x.end == null && now - (x.seen || x.start) > STALE_MS) x.end = Math.max(x.start, x.seen || x.start);
+      map.set(x.uid, x);
+    });
+    sessions.forEach(l => map.set(uidOf(l), l)); // la version locale (plus fraîche) prime
+    return Array.from(map.values());
+  }
+  function pushSession(s, keepalive){
+    const url = ttUrl();
+    if (!url || !s) return Promise.resolve(false);
+    return fetch(url + '?module=temps', {
+      method:'POST', keepalive:!!keepalive,
+      headers:{ 'Content-Type':'text/plain;charset=utf-8' },
+      body: JSON.stringify({ action:'tt_upsert', session:{ uid:uidOf(s), agent:s.agent, activity:s.activity, start:s.start, end:s.end == null ? '' : s.end, seen:Date.now() } })
+    }).then(r => r.json()).then(d => {
+      if (d && d.ok) { if (s.end != null) { s.synced = true; save(); } return true; }
+      return false;
+    }).catch(() => false);
+  }
+  function pushPending(){
+    sessions.forEach(s => { if (s.end != null && !s.synced && s.agent === agent()) pushSession(s); });
+  }
+  let fetchBusy = false;
+  function fetchRemote(){
+    const url = ttUrl();
+    if (!url || fetchBusy || !(window.PORTAL_isSupervisor && window.PORTAL_isSupervisor())) return Promise.resolve();
+    fetchBusy = true;
+    return fetch(url + '?module=temps&action=tt_list').then(r => r.json()).then(d => {
+      if (d && d.ok && Array.isArray(d.sessions)) {
+        remote = d.sessions.map(x => ({ uid:String(x.uid), agent:String(x.agent), activity:String(x.activity),
+          start:Number(x.start), end:(x.end === '' || x.end == null) ? null : Number(x.end), seen:Number(x.seen) || 0 }))
+          .filter(x => x.uid && x.agent && LABELS[x.activity] && isFinite(x.start));
+        lastNames = ''; periodSig = '';
+        render();
+      }
+    }).catch(() => {}).then(() => { fetchBusy = false; });
+  }
+
   // Ferme les sessions restées ouvertes (onglet fermé brutalement) à leur dernier "heartbeat".
   const HB_KEY = 'portal_time_tracking_hb_v1';
   (function closeOrphans(){
@@ -7343,23 +7401,30 @@
     if (current) {
       current.end = Date.now();
       // Ignore les sessions de moins d'une seconde (clics accidentels).
-      if (current.end - current.start < 1000) sessions = sessions.filter(s => s !== current);
+      const closed = current;
+      const tooShort = current.end - current.start < 1000;
+      if (tooShort) sessions = sessions.filter(s => s !== current);
       current = null;
       save();
+      if (tooShort) closed.end = closed.start; // durée nulle côté serveur (ignorée à l'affichage)
+      pushSession(closed, true);
     }
   }
   function start(activity){
     const a = agent();
     if (!a || !LABELS[activity]) return;
     current = { agent:a, activity, start:Date.now(), end:null };
+    uidOf(current);
     sessions.push(current);
     save();
+    pushSession(current);
   }
   function switchTo(name){
     if (current && current.activity === name) { render(); return; }
     stop();
     if (LABELS[name]) start(name);
     renderLive(); render();
+    if (name === 'temps') fetchRemote();
   }
 
   // Un jour à cheval sur minuit : la durée est comptée sur chaque jour concerné.
@@ -7487,7 +7552,7 @@
 
   function firstYear(){
     let fy = new Date().getFullYear() - 1;
-    sessions.forEach(x => { const y = new Date(x.start).getFullYear(); if (y < fy) fy = y; });
+    view().forEach(x => { const y = new Date(x.start).getFullYear(); if (y < fy) fy = y; });
     return fy;
   }
   function monthSpan(v){ const [y, m] = v.split('-').map(Number); return { from:new Date(y, m, 1).getTime(), to:new Date(y, m + 1, 1).getTime() }; }
@@ -7495,7 +7560,7 @@
   // Jours (début de journée, ms) où il existe au moins un temps enregistré, du plus récent au plus ancien.
   function existingDays(){
     const set = new Set(), now = Date.now();
-    sessions.forEach(x => {
+    view().forEach(x => {
       const e = startOfDay(new Date(x.end == null ? now : x.end)).getTime();
       let t = startOfDay(new Date(x.start)).getTime();
       for (let n = 0; t <= e && n < 400; n++) { set.add(t); t = addDays(new Date(t), 1).getTime(); }
@@ -7537,7 +7602,7 @@
   let periodSig = '';
   // Nouvelle session ou nouveau jour : on met à jour les listes sans toucher aux cases cochées.
   function syncPeriodOptions(){
-    const sig = sessions.length + '|' + isoDate(new Date());
+    const sig = view().length + '|' + isoDate(new Date());
     if (sig === periodSig) return;
     periodSig = sig;
     rebuildPeriodOptions();
@@ -7596,7 +7661,7 @@
 
   function filtered(){
     const R = getRange();
-    const rows = sessions.filter(s => !scopeSel.value || s.agent === scopeSel.value);
+    const rows = view().filter(s => !scopeSel.value || s.agent === scopeSel.value);
     return { rows, R };
   }
 
@@ -7604,7 +7669,7 @@
   // (+ l'agent connecté), sans toucher à la sélection en cours.
   let lastNames = '';
   function refreshNames(){
-    const names = Array.from(new Set(sessions.map(s => s.agent).filter(Boolean).concat(agent() || []))).sort((a,b) => a.localeCompare(b, 'fr'));
+    const names = Array.from(new Set(view().map(s => s.agent).filter(Boolean).concat(agent() || []))).sort((a,b) => a.localeCompare(b, 'fr'));
     const key = names.join('|');
     if (key === lastNames) return;
     lastNames = key;
@@ -7801,6 +7866,8 @@
     lastNames = '';
     rebuildPeriodOptions();
     renderLive(); render();
+    pushPending();
+    fetchRemote();
   });
 
   function downloadCsv(header, rows, filename){
@@ -7844,8 +7911,14 @@
   setInterval(() => {
     renderLive();
     try { localStorage.setItem(HB_KEY, String(Date.now())); } catch(e){}
+    ttTick++;
+    if (ttTick % 30 === 0) {
+      if (current) pushSession(current);            // signal de présence : l'agent est connecté
+      if (document.getElementById('app-temps').classList.contains('active')) fetchRemote();
+    }
     if (document.getElementById('app-temps').classList.contains('active')) render();
   }, 1000);
+  let ttTick = 0;
 
   // Fermeture / déconnexion : on clôt la session en cours proprement.
   window.addEventListener('pagehide', stop);
@@ -7859,6 +7932,7 @@
     if (active && !current) { start(active); renderLive(); render(); }
   };
   if (window.PORTAL_onAuthenticated) window.PORTAL_onAuthenticated(startInitial);
+  if (window.PORTAL_onAuthenticated) window.PORTAL_onAuthenticated(() => { pushPending(); fetchRemote(); });
   renderLive(); render();
 })();
 </script>
