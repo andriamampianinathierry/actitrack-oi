@@ -3,7 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ACTIVITY and Tracking</title>
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>Portail Agent — RPI OI / Guichet VDC</title>
 <style>
 /* ==========================================================================
    Styles communs / RPI OI (variables par défaut au niveau :root)
@@ -1442,6 +1445,7 @@
     localStorage.removeItem('portal_config_webapp_url_v1');
     localStorage.removeItem('portal_facebook_local_v1');
     localStorage.removeItem('portal_dedicated_url_incident_v1');
+    localStorage.removeItem('portal_dedicated_url_tt_v1');
   } catch(e){}
 })();
 </script>
@@ -3221,7 +3225,7 @@
 
     <div class="field">
       <label for="portalUrlTt">URL Web App — Temps par activités (suivi partagé superviseurs)</label>
-      <input type="text" id="portalUrlTt" placeholder="https://script.google.com/macros/s/.../exec">
+      <input type="text" id="portalUrlTt" readonly placeholder="https://script.google.com/macros/s/.../exec">
     </div>
 
     <p class="admin-err" id="portalAdminManageErr">Veuillez saisir une URL valide pour chaque champ.</p>
@@ -7073,7 +7077,7 @@
     try { urlRjdInput.value = localStorage.getItem('portal_dedicated_url_rjd_v1') || 'https://script.google.com/macros/s/AKfycbzt6K540BLgGaI1h8Qf_QlrBoTkGSF0o2Xn72wz96f8h6U4CQladyTf5xGIwKxisleO9A/exec'; } catch(e){ urlRjdInput.value = ''; }
     try { urlAuxInput.value = localStorage.getItem('portal_dedicated_url_aux_v1') || window.DEDICATED_getWebappUrl('aux'); } catch(e){ urlAuxInput.value = ''; }
     try { urlIncidentInput.value = localStorage.getItem('portal_dedicated_url_incident_v1') || 'https://script.google.com/macros/s/AKfycbyXgpdNn2jo__oRty-iHHnXCujObvyxRX_Fd4ZxujnQQyMHOFd1eFKG1Udlif3rAvbc5g/exec'; } catch(e){ urlIncidentInput.value = ''; }
-    try { urlTtInput.value = localStorage.getItem('portal_dedicated_url_tt_v1') || 'https://script.google.com/macros/s/AKfycbx4iXRkV9k_rZe3y1Y4FAhGePqYv3i6Gxo8XKvuVJnciY4OFLAvLFg7UONDcEwcVAlBtA/exec'; } catch(e){ urlTtInput.value = ''; }
+    try { urlTtInput.value = 'https://script.google.com/macros/s/AKfycbx4iXRkV9k_rZe3y1Y4FAhGePqYv3i6Gxo8XKvuVJnciY4OFLAvLFg7UONDcEwcVAlBtA/exec'; } catch(e){ urlTtInput.value = ''; }
     manageOverlay.classList.add('show');
   }
 
@@ -7098,7 +7102,6 @@
       window.DEDICATED_setWebappUrl('rjd', urlRjdInput.value.trim());
       window.DEDICATED_setWebappUrl('incident', urlIncidentInput.value.trim());
       window.DEDICATED_setWebappUrl('aux', urlAuxInput.value.trim());
-      try { localStorage.setItem('portal_dedicated_url_tt_v1', urlTtInput.value.trim()); } catch(e){}
     }
     closeManage();
     alert('URL enregistrées. Facebook, Indexation, Mails et Encaissement utilisent leur URL dédiée si renseignée (sinon l\'URL fusionnée). RPI OI, Guichet VDC et ASP OI restent sur l\'URL fusionnée. Rechargez la page pour resynchroniser.');
@@ -7339,7 +7342,7 @@
   // les superviseurs relisent les sessions de TOUS les agents. Sans URL configurée, tout reste local.
   const TT_URL_KEY = 'portal_dedicated_url_tt_v1';
   const TT_DEFAULT_URL = 'https://script.google.com/macros/s/AKfycbx4iXRkV9k_rZe3y1Y4FAhGePqYv3i6Gxo8XKvuVJnciY4OFLAvLFg7UONDcEwcVAlBtA/exec';
-  function ttUrl(){ try { const v = (localStorage.getItem(TT_URL_KEY) || '').trim(); if (v) return v; } catch(e){} return TT_DEFAULT_URL; }
+  function ttUrl(){ return TT_DEFAULT_URL; } // URL forcée en dur : aucun cache local ne peut la remplacer
   function uidOf(s){ return s.uid || (s.uid = s.agent + '|' + s.activity + '|' + s.start); }
   let remote = []; // sessions de tous les agents lues sur le serveur (superviseurs)
   const STALE_MS = 150000; // session distante sans signal depuis 2,5 min => considérée terminée
@@ -7366,15 +7369,21 @@
       return false;
     }).catch(() => false);
   }
+  // Les sessions déjà envoyées au serveur n'ont plus besoin d'être gardées en cache local.
+  function pruneSynced(){
+    const before = sessions.length;
+    sessions = sessions.filter(s => !(s.synced && s.end != null));
+    if (sessions.length !== before) save();
+  }
   function pushPending(){
-    sessions.forEach(s => { if (s.end != null && !s.synced && s.agent === agent()) pushSession(s); });
+    sessions.forEach(s => { if (s.end != null && !s.synced) pushSession(s); });
   }
   let fetchBusy = false;
   function fetchRemote(){
     const url = ttUrl();
     if (!url || fetchBusy || !(window.PORTAL_isSupervisor && window.PORTAL_isSupervisor())) return Promise.resolve();
     fetchBusy = true;
-    return fetch(url + '?module=temps&action=tt_list').then(r => r.json()).then(d => {
+    return fetch(url + '?module=temps&action=tt_list&_=' + Date.now(), { cache:'no-store' }).then(r => r.json()).then(d => {
       if (d && d.ok && Array.isArray(d.sessions)) {
         remote = d.sessions.map(x => ({ uid:String(x.uid), agent:String(x.agent), activity:String(x.activity),
           start:Number(x.start), end:(x.end === '' || x.end == null) ? null : Number(x.end), seen:Number(x.seen) || 0 }))
@@ -7933,6 +7942,7 @@
   };
   if (window.PORTAL_onAuthenticated) window.PORTAL_onAuthenticated(startInitial);
   if (window.PORTAL_onAuthenticated) window.PORTAL_onAuthenticated(() => { pushPending(); fetchRemote(); });
+  setInterval(pruneSynced, 60000);
   renderLive(); render();
 })();
 </script>
